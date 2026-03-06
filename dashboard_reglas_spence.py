@@ -9,7 +9,7 @@ st.set_page_config(page_title="ANALISIS DE DATOS", layout="wide")
 # =========================
 # CONFIG
 # =========================
-RUTA = Path(r"C:\Users\Carlos Molina\OneDrive - ICL CATODOS\Escritorio\Proyectos Carlos Diaz\3.- ANALISIS DE DATOS\DATOSSPENCE.xlsx")
+RUTA = Path("DATOSSPENCE.xlsx")
 COL_TAG = "TAG"
 COL_FECHA = "Fecha_Ingreso"
 MIN_GAP_DIAS = 9
@@ -653,4 +653,5 @@ st.download_button(
     data=csv_all,
     file_name="spence_recurrencias_1_2_3_con_fechas.csv",
     mime="text/csv"
+
 )
