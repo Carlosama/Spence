@@ -125,151 +125,49 @@ def preparar_datos_base(df_raw: pd.DataFrame):
     df["EventoValido"] = df["DeltaDias"].isna() | (df["DeltaDias"] >= MIN_GAP_DIAS)
 
     df_valid = df.loc[df["EventoValido"]].copy()
-
     df_valid["Mes"] = df_valid[COL_FECHA].dt.to_period("M").astype(str)
     df_valid["Trimestre"] = df_valid[COL_FECHA].dt.to_period("Q").astype(str)
     df_valid["Semestre"] = df_valid["Trimestre"].map(trimestre_a_semestre)
-
-    # Días entre mantenciones válidas
     df_valid["DiasEntreMantenciones"] = df_valid.groupby(COL_TAG)[COL_FECHA].diff().dt.days
 
     return df, df_valid
 
 # =========================================================
-# MODELO PRINCIPAL
+# BASE MENSUAL NUEVA REGLA
 # =========================================================
 @st.cache_data(show_spinner=False)
-def construir_modelo_principal(df: pd.DataFrame, df_valid: pd.DataFrame):
-    total_registros_archivo = len(df)
-    total_registros_validos = len(df_valid)
-    total_registros_descartados = total_registros_archivo - total_registros_validos
-    total_tags_unicos = df[COL_TAG].nunique()
+def construir_recurrencia_mensual_por_tag(df_valid: pd.DataFrame):
+    d = df_valid.copy()
+    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
 
-    rec_global = (
-        df_valid.groupby(COL_TAG)
+    base = (
+        d.groupby(["Mes", COL_TAG])
         .agg(
-            Total_Recurrencias=(COL_FECHA, "size"),
-            Ultima_Mantencion=(COL_FECHA, "max")
+            Recurrencia_Mes=(COL_FECHA, "size"),
+            Primera_Fecha=(COL_FECHA, "min"),
+            Ultima_Fecha=(COL_FECHA, "max")
         )
         .reset_index()
     )
 
-    rec_global["Dias_Desde_Ultima_Mantencion"] = (
-        pd.Timestamp.today().normalize() - rec_global["Ultima_Mantencion"].dt.normalize()
-    ).dt.days
+    base["MesTexto"] = base["Mes"].map(mes_a_texto)
+    base["Trimestre"] = pd.to_datetime(base["Mes"] + "-01").dt.to_period("Q").astype(str)
+    base["Semestre"] = base["Trimestre"].map(trimestre_a_semestre)
 
-    rec_global["Ultimo_Trimestre"] = rec_global["Ultima_Mantencion"].dt.to_period("Q").astype(str)
-    rec_global["Ultimo_Semestre"] = rec_global["Ultimo_Trimestre"].map(trimestre_a_semestre)
-
-    problematicos = df_valid[
-        df_valid["DiasEntreMantenciones"].notna() &
-        (df_valid["DiasEntreMantenciones"] < UMBRAL_PROBLEMATICO)
-    ].copy()
-
-    problematicos_por_tag = (
-        problematicos.groupby(COL_TAG)
-        .size()
-        .reset_index(name="Eventos_Problematicos")
-    ) if not problematicos.empty else pd.DataFrame(columns=[COL_TAG, "Eventos_Problematicos"])
-
-    rec_global = rec_global.merge(problematicos_por_tag, on=COL_TAG, how="left")
-    rec_global["Eventos_Problematicos"] = rec_global["Eventos_Problematicos"].fillna(0).astype(int)
-
-    mtbm = (
-        df_valid.groupby(COL_TAG)["DiasEntreMantenciones"]
-        .mean()
-        .reset_index(name="MTBM_Dias")
-    )
-    rec_global = rec_global.merge(mtbm, on=COL_TAG, how="left")
-
-    rec_global["Score_Criticidad"] = (
-        rec_global["Total_Recurrencias"] * 2 +
-        rec_global["Eventos_Problematicos"] * 4 +
-        np.where(rec_global["MTBM_Dias"].fillna(9999) < UMBRAL_PROBLEMATICO, 3, 0)
-    )
-
-    condiciones = [
-        (rec_global["Eventos_Problematicos"] > 0) | (rec_global["Total_Recurrencias"] >= 3),
-        (rec_global["Total_Recurrencias"] == 2),
-        (rec_global["Total_Recurrencias"] == 1),
-    ]
-    opciones = ["Evaluar compra", "Reparar", "Mantener"]
-    rec_global["Accion_Sugerida"] = np.select(condiciones, opciones, default="Retirar")
-
-    condiciones_riesgo = [
-        rec_global["Score_Criticidad"] >= 10,
-        rec_global["Score_Criticidad"].between(6, 9),
-        rec_global["Score_Criticidad"] <= 5
-    ]
-    opciones_riesgo = ["Alto", "Medio", "Bajo"]
-    rec_global["Riesgo"] = np.select(condiciones_riesgo, opciones_riesgo, default="Bajo")
-
-    resumen = {
-        "total_registros_archivo": total_registros_archivo,
-        "total_registros_validos": total_registros_validos,
-        "total_registros_descartados": total_registros_descartados,
-        "total_tags_unicos": total_tags_unicos,
-        "cantidad_tags_problematicos": problematicos[COL_TAG].nunique(),
-        "cantidad_eventos_problematicos": len(problematicos),
-    }
-
-    return rec_global, problematicos, problematicos_por_tag, resumen
-
-# =========================================================
-# TABLAS DERIVADAS
-# =========================================================
-@st.cache_data(show_spinner=False)
-def construir_tabla_fechas_por_tag(df_valid: pd.DataFrame):
-    d = df_valid[[COL_TAG, COL_FECHA]].copy()
-    d = d.sort_values([COL_TAG, COL_FECHA]).reset_index(drop=True)
-
-    d["N"] = d.groupby(COL_TAG).cumcount() + 1
-    d["FechaTxt"] = d[COL_FECHA].dt.strftime("%Y-%m-%d")
-
-    tabla_fechas = (
-        d.pivot(index=COL_TAG, columns="N", values="FechaTxt")
-        .rename(columns=lambda x: f"Mantenimiento_{x}°")
-        .reset_index()
-    )
-
-    return tabla_fechas
+    return base
 
 
 @st.cache_data(show_spinner=False)
-def construir_vista_all(rec_global: pd.DataFrame, tabla_fechas: pd.DataFrame):
-    vista_all = rec_global.merge(tabla_fechas, on=COL_TAG, how="left").copy()
+def construir_detalle_recurrencia_mensual(df_valid: pd.DataFrame):
+    d = df_valid.copy()
+    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
+    d = d.sort_values([COL_TAG, "Mes", COL_FECHA]).reset_index(drop=True)
 
-    vista_all["Recurrencias"] = vista_all["Total_Recurrencias"]
-    vista_all["Ultimo_Trimestre"] = vista_all["Ultimo_Trimestre"].map(trimestre_a_texto)
-    vista_all["Ultimo_Semestre"] = vista_all["Ultimo_Semestre"].map(semestre_a_texto)
-    vista_all["Ultima_Mantencion"] = pd.to_datetime(
-        vista_all["Ultima_Mantencion"], errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
-
-    return vista_all
-
-
-@st.cache_data(show_spinner=False)
-def construir_tabla_mensual_repetidos(df_valid: pd.DataFrame):
-    d = df_valid[[COL_TAG, COL_FECHA, "Mes"]].copy()
-    d = d.sort_values([COL_TAG, COL_FECHA]).reset_index(drop=True)
-
-    conteo = (
-        d.groupby(["Mes", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencia_Mes")
-    )
-
-    conteo = conteo[conteo["Recurrencia_Mes"].isin([2, 3])].copy()
-    if conteo.empty:
-        return pd.DataFrame()
-
-    d = d.merge(conteo[["Mes", COL_TAG, "Recurrencia_Mes"]], on=["Mes", COL_TAG], how="inner")
     d["N_Mes"] = d.groupby(["Mes", COL_TAG]).cumcount() + 1
     d["FechaTxt"] = d[COL_FECHA].dt.strftime("%Y-%m-%d")
 
     pivot = (
-        d.pivot(index=["Mes", COL_TAG, "Recurrencia_Mes"], columns="N_Mes", values="FechaTxt")
+        d.pivot(index=["Mes", COL_TAG], columns="N_Mes", values="FechaTxt")
         .reset_index()
         .rename(columns=lambda x: f"Mantenimiento_{x}°" if isinstance(x, int) else x)
     )
@@ -278,227 +176,165 @@ def construir_tabla_mensual_repetidos(df_valid: pd.DataFrame):
         if col not in pivot.columns:
             pivot[col] = ""
 
-    pivot["Mes_Texto"] = pivot["Mes"].map(mes_a_texto)
-
-    pivot = pivot.sort_values(
-        ["Mes", "Recurrencia_Mes", COL_TAG],
-        ascending=[False, False, True]
-    ).reset_index(drop=True)
-
+    pivot["MesTexto"] = pivot["Mes"].map(mes_a_texto)
     return pivot
 
-
+# =========================================================
+# PROBLEMÁTICOS MENSUALES
+# =========================================================
 @st.cache_data(show_spinner=False)
-def construir_proyeccion_reemplazo(vista_all: pd.DataFrame):
-    if vista_all.empty:
-        return pd.DataFrame()
+def construir_problematicos_mensuales(df_valid: pd.DataFrame):
+    d = df_valid.copy()
+    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
+    d["DiasEntreMantenciones"] = d.groupby(COL_TAG)[COL_FECHA].diff().dt.days
 
-    proy = vista_all.copy()
-
-    proy["MTBM_Dias"] = pd.to_numeric(proy["MTBM_Dias"], errors="coerce")
-    proy["Dias_Desde_Ultima_Mantencion"] = pd.to_numeric(proy["Dias_Desde_Ultima_Mantencion"], errors="coerce")
-
-    condiciones = [
-        (proy["Eventos_Problematicos"] >= 2) | (proy["Total_Recurrencias"] >= 3),
-        (proy["MTBM_Dias"].fillna(9999) < UMBRAL_PROBLEMATICO),
-        (proy["Total_Recurrencias"] == 2),
-    ]
-    opciones = [
-        "Reemplazo prioritario",
-        "Evaluar reemplazo próximo",
-        "Seguir en observación"
-    ]
-
-    proy["Proyeccion_Reemplazo"] = np.select(condiciones, opciones, default="Operación normal")
-
-    columnas = [
-        "TAG",
-        "Total_Recurrencias",
-        "Eventos_Problematicos",
-        "MTBM_Dias",
-        "Dias_Desde_Ultima_Mantencion",
-        "Score_Criticidad",
-        "Riesgo",
-        "Accion_Sugerida",
-        "Proyeccion_Reemplazo"
-    ]
-
-    return proy[columnas].sort_values(
-        ["Score_Criticidad", "Eventos_Problematicos", "Total_Recurrencias", "TAG"],
-        ascending=[False, False, False, True]
-    ).reset_index(drop=True)
-
-# =========================================================
-# FILTROS DE VISTA
-# =========================================================
-def filtrar_vista_principal(vista_all: pd.DataFrame, sel, filtro_trimestre, filtro_semestre,
-                            solo_problematicos, texto_busqueda, rango_dias):
-    vista = vista_all.copy()
-
-    vista = vista[vista["Total_Recurrencias"] == sel].copy()
-
-    if filtro_trimestre != "Todos":
-        vista = vista[vista["Ultimo_Trimestre"] == trimestre_a_texto(filtro_trimestre)]
-
-    if filtro_semestre != "Todos":
-        vista = vista[vista["Ultimo_Semestre"] == semestre_a_texto(filtro_semestre)]
-
-    if solo_problematicos:
-        vista = vista[vista["Eventos_Problematicos"] > 0]
-
-    if texto_busqueda:
-        vista = vista[vista["TAG"].str.contains(texto_busqueda, na=False)]
-
-    vista = vista[
-        (vista["Dias_Desde_Ultima_Mantencion"] >= rango_dias[0]) &
-        (vista["Dias_Desde_Ultima_Mantencion"] <= rango_dias[1])
+    prob = d[
+        d["DiasEntreMantenciones"].notna() &
+        (d["DiasEntreMantenciones"] < UMBRAL_PROBLEMATICO)
     ].copy()
 
-    col_orden = f"Mantenimiento_{sel}°"
-    if col_orden in vista.columns:
-        vista[col_orden] = pd.to_datetime(vista[col_orden], errors="coerce")
-        vista = vista.sort_values(col_orden, ascending=False).reset_index(drop=True)
-        vista[col_orden] = vista[col_orden].dt.strftime("%Y-%m-%d")
+    if prob.empty:
+        return pd.DataFrame(columns=[
+            "Mes", COL_TAG, "Eventos_Problematicos_Mes", "Min_Dias",
+            "MesTexto", "Trimestre", "Semestre", "Recurrencia_Mes"
+        ])
 
-    for i in range(1, 20):
-        col = f"Mantenimiento_{i}°"
-        if col in vista.columns:
-            vista[col] = pd.to_datetime(vista[col], errors="coerce").dt.strftime("%Y-%m-%d")
+    recurrencia_mes = (
+        d.groupby(["Mes", COL_TAG])
+        .size()
+        .reset_index(name="Recurrencia_Mes")
+    )
 
-    return vista
+    base = (
+        prob.groupby(["Mes", COL_TAG])
+        .agg(
+            Eventos_Problematicos_Mes=("DiasEntreMantenciones", "size"),
+            Min_Dias=("DiasEntreMantenciones", "min")
+        )
+        .reset_index()
+    )
 
+    base = base.merge(
+        recurrencia_mes,
+        on=["Mes", COL_TAG],
+        how="left"
+    )
 
-def filtrar_df_valid_para_graficos(df_valid: pd.DataFrame, filtro_trimestre, filtro_semestre):
-    dvalid = df_valid.copy()
+    # SOLO recurrencia 2 o 3 en el mismo mes
+    base = base[base["Recurrencia_Mes"].isin([2, 3])].copy()
+
+    if base.empty:
+        return pd.DataFrame(columns=[
+            "Mes", COL_TAG, "Eventos_Problematicos_Mes", "Min_Dias",
+            "MesTexto", "Trimestre", "Semestre", "Recurrencia_Mes"
+        ])
+
+    base["MesTexto"] = base["Mes"].map(mes_a_texto)
+    base["Trimestre"] = pd.to_datetime(base["Mes"] + "-01").dt.to_period("Q").astype(str)
+    base["Semestre"] = base["Trimestre"].map(trimestre_a_semestre)
+
+    return base
+
+# =========================================================
+# CRITICIDAD MENSUAL
+# =========================================================
+@st.cache_data(show_spinner=False)
+def construir_criticidad_mensual(base_mensual: pd.DataFrame, problematicos_mensuales: pd.DataFrame):
+    crit = base_mensual.copy()
+
+    if problematicos_mensuales.empty:
+        crit["Eventos_Problematicos_Mes"] = 0
+    else:
+        crit = crit.merge(
+            problematicos_mensuales[["Mes", COL_TAG, "Eventos_Problematicos_Mes"]],
+            on=["Mes", COL_TAG],
+            how="left"
+        )
+        crit["Eventos_Problematicos_Mes"] = crit["Eventos_Problematicos_Mes"].fillna(0).astype(int)
+
+    crit["Score_Criticidad_Mes"] = (
+        crit["Recurrencia_Mes"] * 2 +
+        crit["Eventos_Problematicos_Mes"] * 4
+    )
+
+    condiciones = [
+        crit["Score_Criticidad_Mes"] >= 10,
+        crit["Score_Criticidad_Mes"].between(6, 9),
+        crit["Score_Criticidad_Mes"] <= 5
+    ]
+    opciones = ["Alto", "Medio", "Bajo"]
+    crit["Riesgo_Mes"] = np.select(condiciones, opciones, default="Bajo")
+
+    crit["TrimestreTexto"] = crit["Trimestre"].map(trimestre_a_texto)
+    crit["SemestreTexto"] = crit["Semestre"].map(semestre_a_texto)
+
+    return crit.sort_values(["Mes", "Score_Criticidad_Mes"], ascending=[False, False]).reset_index(drop=True)
+
+# =========================================================
+# VISTA PRINCIPAL MENSUAL
+# =========================================================
+def construir_vista_principal_mensual(
+    base_mensual: pd.DataFrame,
+    detalle_mensual: pd.DataFrame,
+    problematicos_mensuales: pd.DataFrame,
+    sel: int,
+    filtro_trimestre: str,
+    filtro_semestre: str,
+    texto_busqueda: str,
+    solo_problematicos: bool
+):
+    vista = base_mensual.copy()
+    vista = vista[vista["Recurrencia_Mes"] == sel].copy()
 
     if filtro_trimestre != "Todos":
-        dvalid = dvalid[dvalid["Trimestre"] == filtro_trimestre]
+        vista = vista[vista["Trimestre"] == filtro_trimestre]
 
     if filtro_semestre != "Todos":
-        dvalid = dvalid[dvalid["Semestre"] == filtro_semestre]
+        vista = vista[vista["Semestre"] == filtro_semestre]
 
-    return dvalid
+    if texto_busqueda:
+        vista = vista[vista[COL_TAG].str.contains(texto_busqueda, na=False)]
+
+    vista = vista.merge(
+        detalle_mensual,
+        on=["Mes", COL_TAG, "MesTexto"],
+        how="left"
+    )
+
+    if problematicos_mensuales.empty:
+        vista["Eventos_Problematicos_Mes"] = 0
+    else:
+        vista = vista.merge(
+            problematicos_mensuales[["Mes", COL_TAG, "Eventos_Problematicos_Mes"]],
+            on=["Mes", COL_TAG],
+            how="left"
+        )
+        vista["Eventos_Problematicos_Mes"] = vista["Eventos_Problematicos_Mes"].fillna(0).astype(int)
+
+    if solo_problematicos:
+        vista = vista[vista["Eventos_Problematicos_Mes"] > 0]
+
+    vista["TrimestreTexto"] = vista["Trimestre"].map(trimestre_a_texto)
+    vista["SemestreTexto"] = vista["Semestre"].map(semestre_a_texto)
+
+    return vista.sort_values(["Mes", COL_TAG], ascending=[False, True]).reset_index(drop=True)
 
 # =========================================================
-# DATOS DE GRÁFICOS
+# RESÚMENES MENSUALES
 # =========================================================
 @st.cache_data(show_spinner=False)
-def preparar_datos_trimestre(sel_recurrencia: int, dvalid: pd.DataFrame):
-    rec_trim = (
-        dvalid.groupby(["Trimestre", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
+def preparar_resumen_recurrencia_mensual(base_mensual: pd.DataFrame, filtro_trimestre: str, filtro_semestre: str):
+    d = base_mensual.copy()
 
-    rec_trim_sel = (
-        rec_trim[rec_trim["Recurrencias"] == sel_recurrencia]
-        .groupby("Trimestre")[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .sort_values("Trimestre")
-    )
+    if filtro_trimestre != "Todos":
+        d = d[d["Trimestre"] == filtro_trimestre]
 
-    if not rec_trim_sel.empty:
-        rec_trim_sel["TrimestreTexto"] = rec_trim_sel["Trimestre"].map(trimestre_a_texto)
-
-    return rec_trim_sel
-
-
-@st.cache_data(show_spinner=False)
-def preparar_datos_recurrencia_tiempo(df_valid: pd.DataFrame, recurrencia_sel: int, frecuencia: str):
-    d = df_valid.copy()
-
-    if frecuencia == "M":
-        campo_periodo = "Mes"
-        d[campo_periodo] = d[COL_FECHA].dt.to_period("M").astype(str)
-    elif frecuencia == "Q":
-        campo_periodo = "Trimestre"
-        d[campo_periodo] = d[COL_FECHA].dt.to_period("Q").astype(str)
-    elif frecuencia == "S":
-        d["TrimestreBase"] = d[COL_FECHA].dt.to_period("Q").astype(str)
-        d["Semestre"] = d["TrimestreBase"].map(trimestre_a_semestre)
-        campo_periodo = "Semestre"
-    else:
-        return pd.DataFrame(columns=["Periodo", "Cantidad", "PeriodoTexto"])
-
-    rec_periodo = (
-        d.groupby([campo_periodo, COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
-
-    rec_sel = (
-        rec_periodo[rec_periodo["Recurrencias"] == recurrencia_sel]
-        .groupby(campo_periodo)[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .rename(columns={campo_periodo: "Periodo"})
-        .sort_values("Periodo")
-        .reset_index(drop=True)
-    )
-
-    if rec_sel.empty:
-        rec_sel["PeriodoTexto"] = []
-        return rec_sel
-
-    if frecuencia == "M":
-        rec_sel["PeriodoTexto"] = rec_sel["Periodo"].map(mes_a_texto)
-    elif frecuencia == "Q":
-        rec_sel["PeriodoTexto"] = rec_sel["Periodo"].map(trimestre_a_texto)
-    else:
-        rec_sel["PeriodoTexto"] = rec_sel["Periodo"].map(semestre_a_texto)
-
-    return rec_sel
-
-
-@st.cache_data(show_spinner=False)
-def preparar_datos_recurrencia_mensual(df_valid_filtrado: pd.DataFrame, recurrencia_sel: int):
-    d = df_valid_filtrado.copy()
-
-    if d.empty:
-        return pd.DataFrame(columns=["Mes", "MesTexto", "Cantidad"])
-
-    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
-
-    rec_mes = (
-        d.groupby(["Mes", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
-
-    rec_mes_sel = (
-        rec_mes[rec_mes["Recurrencias"] == recurrencia_sel]
-        .groupby("Mes")[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .sort_values("Mes")
-        .reset_index(drop=True)
-    )
-
-    if not rec_mes_sel.empty:
-        rec_mes_sel["MesTexto"] = rec_mes_sel["Mes"].map(mes_a_texto)
-
-    return rec_mes_sel
-
-
-@st.cache_data(show_spinner=False)
-def preparar_resumen_general_mensual(df_valid_filtrado: pd.DataFrame):
-    d = df_valid_filtrado.copy()
-
-    if d.empty:
-        return pd.DataFrame(columns=["Mes", "Recurrencias", "Cantidad", "MesTexto"])
-
-    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
-
-    rec_mes = (
-        d.groupby(["Mes", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
+    if filtro_semestre != "Todos":
+        d = d[d["Semestre"] == filtro_semestre]
 
     resumen = (
-        rec_mes[rec_mes["Recurrencias"].isin([1, 2, 3])]
-        .groupby(["Mes", "Recurrencias"])[COL_TAG]
+        d[d["Recurrencia_Mes"].isin([1, 2, 3])]
+        .groupby(["Mes", "Recurrencia_Mes"])[COL_TAG]
         .nunique()
         .reset_index(name="Cantidad")
         .sort_values("Mes")
@@ -512,18 +348,17 @@ def preparar_resumen_general_mensual(df_valid_filtrado: pd.DataFrame):
 
 
 @st.cache_data(show_spinner=False)
-def preparar_problematicos_mensual(df_prob_filtrado: pd.DataFrame):
-    d = df_prob_filtrado.copy()
+def preparar_datos_recurrencia_mensual_filtrada(base_mensual: pd.DataFrame, recurrencia_sel: int, filtro_trimestre: str, filtro_semestre: str):
+    d = base_mensual.copy()
+    d = d[d["Recurrencia_Mes"] == recurrencia_sel].copy()
 
-    if d.empty:
-        return (
-            pd.DataFrame(columns=["Mes", "MesTexto", "Cantidad"]),
-            pd.DataFrame(columns=["Mes", "MesTexto", "Eventos"])
-        )
+    if filtro_trimestre != "Todos":
+        d = d[d["Trimestre"] == filtro_trimestre]
 
-    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
+    if filtro_semestre != "Todos":
+        d = d[d["Semestre"] == filtro_semestre]
 
-    tags_mes = (
+    datos = (
         d.groupby("Mes")[COL_TAG]
         .nunique()
         .reset_index(name="Cantidad")
@@ -531,92 +366,99 @@ def preparar_problematicos_mensual(df_prob_filtrado: pd.DataFrame):
         .reset_index(drop=True)
     )
 
-    eventos_mes = (
-        d.groupby("Mes")
-        .size()
-        .reset_index(name="Eventos")
-        .sort_values("Mes")
-        .reset_index(drop=True)
-    )
+    if not datos.empty:
+        datos["MesTexto"] = datos["Mes"].map(mes_a_texto)
 
-    if not tags_mes.empty:
-        tags_mes["MesTexto"] = tags_mes["Mes"].map(mes_a_texto)
+    return datos
 
-    if not eventos_mes.empty:
-        eventos_mes["MesTexto"] = eventos_mes["Mes"].map(mes_a_texto)
-
-    return tags_mes, eventos_mes
-
-
+# =========================================================
+# TABLA DE REPETIDOS POR MES
+# =========================================================
 @st.cache_data(show_spinner=False)
-def preparar_distribucion_mensual_recurrencia(df_valid_filtrado: pd.DataFrame, recurrencia_sel: int):
-    d = df_valid_filtrado.copy()
+def construir_tabla_mensual_repetidos(base_mensual: pd.DataFrame, detalle_mensual: pd.DataFrame):
+    tabla = base_mensual.copy()
+    tabla = tabla[tabla["Recurrencia_Mes"].isin([2, 3])].copy()
 
-    if d.empty:
-        return pd.DataFrame(columns=["Mes", "MesTexto", "Cantidad"])
-
-    d["Mes"] = d[COL_FECHA].dt.to_period("M").astype(str)
-
-    rec_mes = (
-        d.groupby(["Mes", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
-
-    dist = (
-        rec_mes[rec_mes["Recurrencias"] == recurrencia_sel]
-        .groupby("Mes")[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .sort_values("Mes")
-        .reset_index(drop=True)
-    )
-
-    if not dist.empty:
-        dist["MesTexto"] = dist["Mes"].map(mes_a_texto)
-        dist["Indice"] = range(len(dist))
-
-    return dist
-
-
-@st.cache_data(show_spinner=False)
-def construir_proyeccion_criticidad_futura(vista_all: pd.DataFrame, meses_proyeccion: int, recurrencia_sel: int):
-    if vista_all.empty:
+    if tabla.empty:
         return pd.DataFrame()
 
-    df = vista_all.copy()
+    tabla = tabla.merge(
+        detalle_mensual,
+        on=["Mes", COL_TAG, "MesTexto"],
+        how="left"
+    )
 
-    df["Total_Recurrencias"] = pd.to_numeric(df["Total_Recurrencias"], errors="coerce").fillna(0)
-    df["Eventos_Problematicos"] = pd.to_numeric(df["Eventos_Problematicos"], errors="coerce").fillna(0)
-    df["MTBM_Dias"] = pd.to_numeric(df["MTBM_Dias"], errors="coerce")
-    df["Dias_Desde_Ultima_Mantencion"] = pd.to_numeric(df["Dias_Desde_Ultima_Mantencion"], errors="coerce").fillna(0)
-    df["Score_Criticidad"] = pd.to_numeric(df["Score_Criticidad"], errors="coerce").fillna(0)
+    tabla = tabla.sort_values(
+        ["Mes", "Recurrencia_Mes", COL_TAG],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
 
-    df = df[df["Total_Recurrencias"] == recurrencia_sel].copy()
+    return tabla
+
+# =========================================================
+# PROYECCIÓN DE REEMPLAZO MENSUAL
+# =========================================================
+@st.cache_data(show_spinner=False)
+def construir_proyeccion_reemplazo_mensual(criticidad_mensual: pd.DataFrame):
+    if criticidad_mensual.empty:
+        return pd.DataFrame()
+
+    proy = criticidad_mensual.copy()
+
+    condiciones = [
+        (proy["Eventos_Problematicos_Mes"] >= 2) | (proy["Recurrencia_Mes"] >= 3),
+        (proy["Recurrencia_Mes"] == 2),
+        (proy["Recurrencia_Mes"] == 1),
+    ]
+    opciones = [
+        "Reemplazo prioritario",
+        "Evaluar reemplazo próximo",
+        "Seguir en observación"
+    ]
+
+    proy["Proyeccion_Reemplazo"] = np.select(condiciones, opciones, default="Operación normal")
+
+    columnas = [
+        "MesTexto",
+        "TAG",
+        "Recurrencia_Mes",
+        "Eventos_Problematicos_Mes",
+        "Score_Criticidad_Mes",
+        "Riesgo_Mes",
+        "Proyeccion_Reemplazo"
+    ]
+
+    return proy[columnas].sort_values(
+        ["MesTexto", "Score_Criticidad_Mes", "TAG"],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
+
+# =========================================================
+# PROYECCIÓN FUTURA MENSUAL
+# =========================================================
+@st.cache_data(show_spinner=False)
+def construir_proyeccion_criticidad_futura_mensual(criticidad_mensual: pd.DataFrame, meses_proyeccion: int, recurrencia_sel: int):
+    if criticidad_mensual.empty:
+        return pd.DataFrame()
+
+    df = criticidad_mensual.copy()
+    df = df[df["Recurrencia_Mes"] == recurrencia_sel].copy()
 
     if df.empty:
         return pd.DataFrame()
 
-    dias_futuros = meses_proyeccion * 30
-
-    df["Probable_Nueva_Recurrencia"] = np.where(
-        df["MTBM_Dias"].notna() & ((df["Dias_Desde_Ultima_Mantencion"] + dias_futuros) >= df["MTBM_Dias"]),
-        1,
-        0
+    incremento = np.select(
+        [meses_proyeccion == 4, meses_proyeccion == 5, meses_proyeccion == 6, meses_proyeccion == 7],
+        [1, 1, 2, 2],
+        default=1
     )
 
-    df["Eventos_Problematicos_Futuros"] = df["Eventos_Problematicos"] + np.where(
-        df["MTBM_Dias"].notna() & (df["MTBM_Dias"] < UMBRAL_PROBLEMATICO) & (df["Probable_Nueva_Recurrencia"] == 1),
-        1,
-        0
-    )
-
-    df["Recurrencias_Futuras"] = df["Total_Recurrencias"] + df["Probable_Nueva_Recurrencia"]
+    df["Recurrencias_Futuras"] = df["Recurrencia_Mes"] + incremento
+    df["Eventos_Problematicos_Futuros"] = df["Eventos_Problematicos_Mes"] + np.where(df["Riesgo_Mes"].isin(["Medio", "Alto"]), 1, 0)
 
     df["Score_Criticidad_Futura"] = (
         df["Recurrencias_Futuras"] * 2 +
-        df["Eventos_Problematicos_Futuros"] * 4 +
-        np.where(df["MTBM_Dias"].fillna(9999) < UMBRAL_PROBLEMATICO, 3, 0)
+        df["Eventos_Problematicos_Futuros"] * 4
     )
 
     condiciones = [
@@ -628,84 +470,64 @@ def construir_proyeccion_criticidad_futura(vista_all: pd.DataFrame, meses_proyec
     df["Riesgo_Futuro"] = np.select(condiciones, opciones, default="Bajo")
 
     return df[[
+        "MesTexto",
         "TAG",
-        "Total_Recurrencias",
-        "Eventos_Problematicos",
-        "MTBM_Dias",
-        "Dias_Desde_Ultima_Mantencion",
-        "Score_Criticidad",
+        "Recurrencia_Mes",
+        "Eventos_Problematicos_Mes",
+        "Score_Criticidad_Mes",
         "Recurrencias_Futuras",
         "Eventos_Problematicos_Futuros",
         "Score_Criticidad_Futura",
         "Riesgo_Futuro"
     ]].sort_values(
-        ["Score_Criticidad_Futura", "Score_Criticidad", "TAG"],
+        ["Score_Criticidad_Futura", "Score_Criticidad_Mes", "TAG"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
 
 # =========================================================
 # GRÁFICOS
 # =========================================================
-def graficar_resumen_trimestre(sel_recurrencia: int, datos_trim: pd.DataFrame):
-    st.subheader("📊 Recurrencia por trimestre")
+def graficar_recurrencia_mensual(datos_mes: pd.DataFrame, recurrencia_sel: int):
+    st.subheader("📊 Recurrencia por mes")
 
-    if datos_trim.empty:
-        st.info(f"No hay TAG con recurrencia {sel_recurrencia} por trimestre.")
+    if datos_mes.empty:
+        st.info(f"No hay TAG con recurrencia {recurrencia_sel} por mes en el filtro aplicado.")
         return
 
-    fila_max = datos_trim.loc[datos_trim["Cantidad"].idxmax()]
-    trimestre_max = fila_max["TrimestreTexto"]
-    cantidad_max = int(fila_max["Cantidad"])
+    fig, ax = plt.subplots(figsize=(5.0, 2.8))
+    bars = ax.bar(datos_mes["MesTexto"], datos_mes["Cantidad"])
 
-    st.metric("Trimestre con mayor recurrencia", trimestre_max)
-    st.metric("Cantidad de TAG", cantidad_max)
-
-    st.caption(
-        f"Interpretación: en {trimestre_max} hubo {cantidad_max} TAG "
-        f"que presentaron recurrencia {sel_recurrencia}."
-    )
-
-    fig, ax = plt.subplots(figsize=(5.2, 2.9))
-    bars = ax.bar(datos_trim["TrimestreTexto"], datos_trim["Cantidad"])
-    ax.set_title(f"Cantidad de TAG con recurrencia {sel_recurrencia}", fontsize=10)
-    ax.set_xlabel("Trimestre", fontsize=9)
-    ax.set_ylabel("Cantidad de TAG", fontsize=9)
+    ax.set_title(f"TAG con recurrencia {recurrencia_sel} por mes", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
+    ax.set_ylabel("Cantidad", fontsize=9)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
     ax.grid(True, axis="y", alpha=0.3)
     ax.tick_params(axis="x", rotation=20, labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
-    y_max = datos_trim["Cantidad"].max()
+
+    y_max = datos_mes["Cantidad"].max()
     ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
     agregar_etiquetas_barras(ax, bars)
+
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 
-def graficar_resumen_general(dvalid: pd.DataFrame):
-    st.markdown("### 📈 Resumen general por trimestre")
+def graficar_resumen_general_mensual(resumen_mes: pd.DataFrame):
+    st.markdown("### 📈 Resumen general por mes")
 
-    rec_trim = (
-        dvalid.groupby(["Trimestre", COL_TAG])
-        .size()
-        .reset_index(name="Recurrencias")
-    )
-
-    resumen = (
-        rec_trim[rec_trim["Recurrencias"].isin([1, 2, 3])]
-        .groupby(["Trimestre", "Recurrencias"])[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-    )
-
-    if resumen.empty:
-        st.info("No hay datos para generar el resumen general por trimestre.")
+    if resumen_mes.empty:
+        st.info("No hay datos para generar el resumen mensual.")
         return
 
-    pivot = resumen.pivot(index="Trimestre", columns="Recurrencias", values="Cantidad").fillna(0).sort_index()
-    pivot.index = [trimestre_a_texto(x) for x in pivot.index]
+    pivot = (
+        resumen_mes.pivot(index="MesTexto", columns="Recurrencia_Mes", values="Cantidad")
+        .fillna(0)
+    )
 
-    fig, ax = plt.subplots(figsize=(5.2, 2.9))
+    fig, ax = plt.subplots(figsize=(5.0, 2.8))
+
     for rec in [1, 2, 3]:
         if rec in pivot.columns:
             ax.plot(pivot.index, pivot[rec], marker="o", label=f"Recurrencia {rec}")
@@ -719,92 +541,137 @@ def graficar_resumen_general(dvalid: pd.DataFrame):
                     fontsize=7
                 )
 
-    ax.set_title("TAG por recurrencia y trimestre", fontsize=10)
-    ax.set_xlabel("Trimestre", fontsize=9)
-    ax.set_ylabel("Cantidad de TAG", fontsize=9)
+    ax.set_title("TAG por recurrencia y mes", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
+    ax.set_ylabel("Cantidad", fontsize=9)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(fontsize=8)
     ax.tick_params(axis="x", rotation=20, labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
+
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 
-def graficar_problematicos_trimestre(df_prob: pd.DataFrame):
-    st.markdown("### 📊 Problemas por trimestre")
+def graficar_problematicos_mes(tags_mes: pd.DataFrame):
+    st.markdown("### 📊 TAG problemáticos por mes")
 
-    if df_prob.empty:
-        st.info("No hay datos por trimestre.")
+    if tags_mes.empty:
+        st.info("No hay TAG problemáticos por mes en el filtro aplicado.")
         return
-
-    prob_trim = (
-        df_prob.groupby("Trimestre")[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .sort_values("Trimestre")
-    )
-
-    if prob_trim.empty:
-        st.info("No hay datos por trimestre.")
-        return
-
-    prob_trim["TrimestreTexto"] = prob_trim["Trimestre"].map(trimestre_a_texto)
 
     fig, ax = plt.subplots(figsize=(5.0, 2.8))
-    bars = ax.bar(prob_trim["TrimestreTexto"], prob_trim["Cantidad"])
-    ax.set_title("TAG problemáticos por trimestre", fontsize=10)
-    ax.set_xlabel("Trimestre", fontsize=9)
+    bars = ax.bar(tags_mes["MesTexto"], tags_mes["Cantidad"])
+
+    ax.set_title("TAG problemáticos por mes", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
     ax.set_ylabel("Cantidad de TAG", fontsize=9)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
     ax.grid(True, axis="y", alpha=0.3)
     ax.tick_params(axis="x", rotation=20, labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
-    y_max = prob_trim["Cantidad"].max()
+
+    y_max = tags_mes["Cantidad"].max()
     ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
     agregar_etiquetas_barras(ax, bars)
+
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 
-def graficar_problematicos_semestre(df_prob: pd.DataFrame):
-    st.markdown("### 📊 Problemas por semestre")
+def graficar_eventos_problematicos_mes(eventos_mes: pd.DataFrame):
+    st.markdown("### 📊 Eventos problemáticos por mes")
 
-    if df_prob.empty:
-        st.info("No hay datos por semestre.")
+    if eventos_mes.empty:
+        st.info("No hay eventos problemáticos por mes en el filtro aplicado.")
         return
-
-    df_prob_sem = df_prob.copy()
-    df_prob_sem["Semestre"] = df_prob_sem["Trimestre"].map(trimestre_a_semestre)
-
-    prob_sem = (
-        df_prob_sem.groupby("Semestre")[COL_TAG]
-        .nunique()
-        .reset_index(name="Cantidad")
-        .sort_values("Semestre")
-    )
-
-    if prob_sem.empty:
-        st.info("No hay datos por semestre.")
-        return
-
-    prob_sem["SemestreTexto"] = prob_sem["Semestre"].map(semestre_a_texto)
 
     fig, ax = plt.subplots(figsize=(5.0, 2.8))
-    bars = ax.bar(prob_sem["SemestreTexto"], prob_sem["Cantidad"])
-    ax.set_title("TAG problemáticos por semestre", fontsize=10)
-    ax.set_xlabel("Semestre", fontsize=9)
+    bars = ax.bar(eventos_mes["MesTexto"], eventos_mes["Eventos"])
+
+    ax.set_title("Eventos problemáticos por mes", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
+    ax.set_ylabel("Eventos", fontsize=9)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.tick_params(axis="x", rotation=20, labelsize=8)
+    ax.tick_params(axis="y", labelsize=8)
+
+    y_max = eventos_mes["Eventos"].max()
+    ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
+    agregar_etiquetas_barras(ax, bars)
+
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+
+
+def graficar_recurrencia_en_el_tiempo(datos_mes: pd.DataFrame, recurrencia_sel: int):
+    st.markdown("### 📈 Recurrencia en el tiempo")
+
+    if datos_mes.empty:
+        st.info(f"No hay TAG con recurrencia {recurrencia_sel} en el rango seleccionado.")
+        return
+
+    fila_max = datos_mes.loc[datos_mes["Cantidad"].idxmax()]
+    periodo_max = fila_max["MesTexto"]
+    cantidad_max = int(fila_max["Cantidad"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Mes con mayor recurrencia", periodo_max)
+    with c2:
+        st.metric("Cantidad de TAG", cantidad_max)
+
+    fig, ax = plt.subplots(figsize=(4.8, 2.8))
+    bars = ax.bar(datos_mes["MesTexto"], datos_mes["Cantidad"])
+
+    ax.set_title(f"TAG con recurrencia {recurrencia_sel} por mes", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
+    ax.set_ylabel("Cantidad", fontsize=9)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.tick_params(axis="x", labelrotation=20, labelsize=8)
+    ax.tick_params(axis="y", labelsize=8)
+
+    y_max = datos_mes["Cantidad"].max()
+    ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1)
+    agregar_etiquetas_barras(ax, bars)
+
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+
+
+def graficar_campana_recurrencia_mensual(dist_mes: pd.DataFrame, recurrencia_sel: int):
+    st.markdown("### 🔔 Distribución mensual de recurrencia")
+
+    if dist_mes.empty:
+        st.info(f"No hay datos para la distribución mensual de recurrencia {recurrencia_sel}.")
+        return
+
+    fig, ax = plt.subplots(figsize=(5.4, 3.0))
+    bars = ax.bar(dist_mes["MesTexto"], dist_mes["Cantidad"], alpha=0.65)
+
+    y_smooth = dist_mes["Cantidad"].rolling(window=3, center=True, min_periods=1).mean()
+    ax.plot(dist_mes["MesTexto"], y_smooth, marker="o", linewidth=2)
+
+    ax.set_title(f"Distribución mensual de TAG con recurrencia {recurrencia_sel}", fontsize=10)
+    ax.set_xlabel("Mes", fontsize=9)
     ax.set_ylabel("Cantidad de TAG", fontsize=9)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
     ax.grid(True, axis="y", alpha=0.3)
     ax.tick_params(axis="x", rotation=20, labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
-    y_max = prob_sem["Cantidad"].max()
-    ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
+
+    y_max = dist_mes["Cantidad"].max()
+    ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1)
     agregar_etiquetas_barras(ax, bars)
+
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
@@ -833,266 +700,10 @@ def graficar_reemplazo_proyectado(df_proy: pd.DataFrame):
     ax.grid(True, axis="y", alpha=0.3)
     ax.tick_params(axis="x", rotation=20, labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
+
     y_max = resumen["Cantidad"].max()
     ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
     agregar_etiquetas_barras(ax, bars)
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_recurrencia_en_el_tiempo(df_tiempo: pd.DataFrame, recurrencia_sel: int, etiqueta_periodo: str):
-    st.markdown("### 📈 Recurrencia en el tiempo")
-
-    if df_tiempo.empty:
-        st.info(f"No hay TAG con recurrencia {recurrencia_sel} en el rango seleccionado.")
-        return
-
-    fila_max = df_tiempo.loc[df_tiempo["Cantidad"].idxmax()]
-    periodo_max = fila_max["PeriodoTexto"]
-    cantidad_max = int(fila_max["Cantidad"])
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric(f"{etiqueta_periodo} con mayor recurrencia", periodo_max)
-    with c2:
-        st.metric("Cantidad de TAG", cantidad_max)
-
-    fig, ax = plt.subplots(figsize=(4.8, 2.8))
-    bars = ax.bar(df_tiempo["PeriodoTexto"], df_tiempo["Cantidad"])
-
-    ax.set_title(
-        f"TAG con recurrencia {recurrencia_sel} por {etiqueta_periodo.lower()}",
-        fontsize=10
-    )
-    ax.set_xlabel(etiqueta_periodo, fontsize=9)
-    ax.set_ylabel("Cantidad", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax.tick_params(axis="x", labelrotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    y_max = df_tiempo["Cantidad"].max()
-    ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            color="black"
-        )
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_recurrencia_mensual(datos_mes: pd.DataFrame, recurrencia_sel: int):
-    st.subheader("📊 Recurrencia por mes")
-
-    if datos_mes.empty:
-        st.info(f"No hay TAG con recurrencia {recurrencia_sel} por mes en el filtro aplicado.")
-        return
-
-    fig, ax = plt.subplots(figsize=(5.0, 2.8))
-    bars = ax.bar(datos_mes["MesTexto"], datos_mes["Cantidad"])
-
-    ax.set_title(f"TAG con recurrencia {recurrencia_sel} por mes", fontsize=10)
-    ax.set_xlabel("Mes", fontsize=9)
-    ax.set_ylabel("Cantidad", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax.tick_params(axis="x", rotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    y_max = datos_mes["Cantidad"].max()
-    ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            color="black"
-        )
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_resumen_general_mensual(resumen_mes: pd.DataFrame):
-    st.markdown("### 📈 Resumen general por mes")
-
-    if resumen_mes.empty:
-        st.info("No hay datos para generar el resumen mensual.")
-        return
-
-    pivot = (
-        resumen_mes.pivot(index="MesTexto", columns="Recurrencias", values="Cantidad")
-        .fillna(0)
-    )
-
-    fig, ax = plt.subplots(figsize=(5.0, 2.8))
-
-    for rec in [1, 2, 3]:
-        if rec in pivot.columns:
-            ax.plot(pivot.index, pivot[rec], marker="o", label=f"Recurrencia {rec}")
-            for x, y in zip(pivot.index, pivot[rec]):
-                ax.annotate(
-                    f"{int(y):,}".replace(",", "."),
-                    xy=(x, y),
-                    xytext=(0, 4),
-                    textcoords="offset points",
-                    ha="center",
-                    fontsize=7
-                )
-
-    ax.set_title("TAG por recurrencia y mes", fontsize=10)
-    ax.set_xlabel("Mes", fontsize=9)
-    ax.set_ylabel("Cantidad", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(fontsize=8)
-
-    ax.tick_params(axis="x", rotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_problematicos_mes(tags_mes: pd.DataFrame):
-    st.markdown("### 📊 TAG problemáticos por mes")
-
-    if tags_mes.empty:
-        st.info("No hay TAG problemáticos por mes en el filtro aplicado.")
-        return
-
-    fig, ax = plt.subplots(figsize=(5.0, 2.8))
-    bars = ax.bar(tags_mes["MesTexto"], tags_mes["Cantidad"])
-
-    ax.set_title("TAG problemáticos por mes", fontsize=10)
-    ax.set_xlabel("Mes", fontsize=9)
-    ax.set_ylabel("Cantidad de TAG", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax.tick_params(axis="x", rotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    y_max = tags_mes["Cantidad"].max()
-    ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            color="black"
-        )
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_eventos_problematicos_mes(eventos_mes: pd.DataFrame):
-    st.markdown("### 📊 Eventos problemáticos por mes")
-
-    if eventos_mes.empty:
-        st.info("No hay eventos problemáticos por mes en el filtro aplicado.")
-        return
-
-    fig, ax = plt.subplots(figsize=(5.0, 2.8))
-    bars = ax.bar(eventos_mes["MesTexto"], eventos_mes["Eventos"])
-
-    ax.set_title("Eventos problemáticos por mes", fontsize=10)
-    ax.set_xlabel("Mes", fontsize=9)
-    ax.set_ylabel("Eventos", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax.tick_params(axis="x", rotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    y_max = eventos_mes["Eventos"].max()
-    ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            color="black"
-        )
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-
-def graficar_campana_recurrencia_mensual(dist_mes: pd.DataFrame, recurrencia_sel: int):
-    st.markdown("### 🔔 Distribución mensual de recurrencia")
-
-    if dist_mes.empty:
-        st.info(f"No hay datos para la distribución mensual de recurrencia {recurrencia_sel}.")
-        return
-
-    fig, ax = plt.subplots(figsize=(5.4, 3.0))
-
-    bars = ax.bar(dist_mes["MesTexto"], dist_mes["Cantidad"], alpha=0.65)
-
-    y_smooth = dist_mes["Cantidad"].rolling(window=3, center=True, min_periods=1).mean()
-    ax.plot(dist_mes["MesTexto"], y_smooth, marker="o", linewidth=2)
-
-    ax.set_title(f"Distribución mensual de TAG con recurrencia {recurrencia_sel}", fontsize=10)
-    ax.set_xlabel("Mes", fontsize=9)
-    ax.set_ylabel("Cantidad de TAG", fontsize=9)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax.tick_params(axis="x", rotation=20, labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-
-    y_max = dist_mes["Cantidad"].max()
-    ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7
-        )
 
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
@@ -1124,24 +735,12 @@ def graficar_proyeccion_criticidad_futura(df_futuro: pd.DataFrame, meses_proyecc
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{int(x):,}".replace(",", ".")))
     ax.grid(True, axis="y", alpha=0.3)
-
     ax.tick_params(axis="x", labelsize=8)
     ax.tick_params(axis="y", labelsize=8)
 
     y_max = resumen["Cantidad"].max()
     ax.set_ylim(0, y_max * 1.18 if y_max > 0 else 1)
-
-    for bar in bars:
-        altura = bar.get_height()
-        ax.annotate(
-            f"{int(altura):,}".replace(",", "."),
-            xy=(bar.get_x() + bar.get_width() / 2, altura),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7
-        )
+    agregar_etiquetas_barras(ax, bars)
 
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
@@ -1151,8 +750,8 @@ def graficar_proyeccion_criticidad_futura(df_futuro: pd.DataFrame, meses_proyecc
 # =========================================================
 st.title("ANÁLISIS DE DATOS MINERA SPENCE")
 st.caption(
-    "Las recurrencias se calculan internamente agrupando registros del mismo TAG "
-    "que estén a menos de 9 días como un solo evento válido."
+    "Las recurrencias se calculan agrupando registros válidos del mismo TAG dentro del mismo mes. "
+    "Recurrencia 1 = 1 vez en el mes, Recurrencia 2 = 2 veces en el mes, Recurrencia 3 = 3 veces en el mes."
 )
 
 # =========================================================
@@ -1186,11 +785,28 @@ else:
 # =========================================================
 try:
     df, df_valid = preparar_datos_base(df_raw)
-    rec_global, tags_problematicos_df, problematicos_por_tag, resumen = construir_modelo_principal(df, df_valid)
-    tabla_fechas = construir_tabla_fechas_por_tag(df_valid)
-    vista_all = construir_vista_all(rec_global, tabla_fechas)
-    tabla_mensual_repetidos = construir_tabla_mensual_repetidos(df_valid)
-    proyeccion_reemplazo = construir_proyeccion_reemplazo(vista_all)
+
+    total_registros_archivo = len(df)
+    total_registros_validos = len(df_valid)
+    total_registros_descartados = len(df) - len(df_valid)
+    total_tags_unicos = df[COL_TAG].nunique()
+
+    base_mensual = construir_recurrencia_mensual_por_tag(df_valid)
+    detalle_mensual = construir_detalle_recurrencia_mensual(df_valid)
+    problematicos_mensuales = construir_problematicos_mensuales(df_valid)
+    criticidad_mensual = construir_criticidad_mensual(base_mensual, problematicos_mensuales)
+    tabla_mensual_repetidos = construir_tabla_mensual_repetidos(base_mensual, detalle_mensual)
+    proyeccion_reemplazo = construir_proyeccion_reemplazo_mensual(criticidad_mensual)
+
+    resumen = {
+        "total_registros_archivo": total_registros_archivo,
+        "total_registros_validos": total_registros_validos,
+        "total_registros_descartados": total_registros_descartados,
+        "total_tags_unicos": total_tags_unicos,
+        "cantidad_tags_problematicos": problematicos_mensuales[COL_TAG].nunique() if not problematicos_mensuales.empty else 0,
+        "cantidad_eventos_problematicos": int(problematicos_mensuales["Eventos_Problematicos_Mes"].sum()) if not problematicos_mensuales.empty else 0,
+    }
+
 except Exception as e:
     st.error(f"Error al procesar archivo: {e}")
     st.stop()
@@ -1204,69 +820,16 @@ if df_valid.empty:
 # =========================================================
 st.sidebar.header("🔎 Filtros de navegación")
 
-sel = st.sidebar.selectbox("Mostrar recurrencia:", [1, 2, 3], index=0)
+sel = st.sidebar.selectbox("Mostrar recurrencia mensual:", [1, 2, 3], index=0)
 
-opciones_trimestre = ["Todos"] + sorted(df_valid["Trimestre"].dropna().unique().tolist())
+opciones_trimestre = ["Todos"] + sorted(base_mensual["Trimestre"].dropna().unique().tolist())
 filtro_trimestre = st.sidebar.selectbox("Filtrar por trimestre:", opciones_trimestre, index=0)
 
-opciones_semestre = ["Todos"] + sorted(df_valid["Semestre"].dropna().unique().tolist())
+opciones_semestre = ["Todos"] + sorted(base_mensual["Semestre"].dropna().unique().tolist())
 filtro_semestre = st.sidebar.selectbox("Filtrar por semestre:", opciones_semestre, index=0)
 
 solo_problematicos = st.sidebar.checkbox("Mostrar solo TAG problemáticos", value=False)
 texto_busqueda = st.sidebar.text_input("Buscar TAG", "").strip().upper()
-
-dias_min = int(vista_all["Dias_Desde_Ultima_Mantencion"].min()) if not vista_all.empty else 0
-dias_max = int(vista_all["Dias_Desde_Ultima_Mantencion"].max()) if not vista_all.empty else 0
-
-rango_dias = st.sidebar.slider(
-    "Días desde última mantención",
-    min_value=dias_min,
-    max_value=dias_max if dias_max >= dias_min else dias_min,
-    value=(dias_min, dias_max if dias_max >= dias_min else dias_min)
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📈 Recurrencia en el tiempo")
-
-tipo_periodo = st.sidebar.selectbox(
-    "Escala de tiempo",
-    options=["Mensual", "Trimestral", "Semestral"],
-    index=0
-)
-
-if tipo_periodo == "Mensual":
-    frecuencia_tiempo = "M"
-    etiqueta_periodo = "Mes"
-    opciones_periodo = sorted(df_valid["Mes"].dropna().unique().tolist())
-    formato_periodo = mes_a_texto
-elif tipo_periodo == "Trimestral":
-    frecuencia_tiempo = "Q"
-    etiqueta_periodo = "Trimestre"
-    opciones_periodo = sorted(df_valid["Trimestre"].dropna().unique().tolist())
-    formato_periodo = trimestre_a_texto
-else:
-    frecuencia_tiempo = "S"
-    etiqueta_periodo = "Semestre"
-    opciones_periodo = sorted(df_valid["Semestre"].dropna().unique().tolist())
-    formato_periodo = semestre_a_texto
-
-if opciones_periodo:
-    periodo_desde = st.sidebar.selectbox(
-        f"{etiqueta_periodo} desde",
-        options=opciones_periodo,
-        index=0,
-        format_func=formato_periodo
-    )
-
-    periodo_hasta = st.sidebar.selectbox(
-        f"{etiqueta_periodo} hasta",
-        options=opciones_periodo,
-        index=len(opciones_periodo) - 1,
-        format_func=formato_periodo
-    )
-else:
-    periodo_desde = None
-    periodo_hasta = None
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔮 Proyección futura")
@@ -1280,56 +843,83 @@ meses_proyeccion = st.sidebar.selectbox(
 # =========================================================
 # FILTRADO
 # =========================================================
-vista = filtrar_vista_principal(
-    vista_all=vista_all,
+vista = construir_vista_principal_mensual(
+    base_mensual=base_mensual,
+    detalle_mensual=detalle_mensual,
+    problematicos_mensuales=problematicos_mensuales,
     sel=sel,
     filtro_trimestre=filtro_trimestre,
     filtro_semestre=filtro_semestre,
-    solo_problematicos=solo_problematicos,
     texto_busqueda=texto_busqueda,
-    rango_dias=rango_dias
+    solo_problematicos=solo_problematicos
 )
 
-dvalid_filtrado = filtrar_df_valid_para_graficos(df_valid, filtro_trimestre, filtro_semestre)
-datos_trim = preparar_datos_trimestre(sel, dvalid_filtrado)
+resumen_general_mes = preparar_resumen_recurrencia_mensual(
+    base_mensual=base_mensual,
+    filtro_trimestre=filtro_trimestre,
+    filtro_semestre=filtro_semestre
+)
 
-usar_vista_mensual = (filtro_trimestre != "Todos") or (filtro_semestre != "Todos")
-
-datos_recurrencia_mes = preparar_datos_recurrencia_mensual(dvalid_filtrado, sel)
-resumen_general_mes = preparar_resumen_general_mensual(dvalid_filtrado)
-
-tags_problematicos_filtrado = tags_problematicos_df.copy()
-if not tags_problematicos_filtrado.empty:
-    if filtro_trimestre != "Todos":
-        tags_problematicos_filtrado = tags_problematicos_filtrado[
-            tags_problematicos_filtrado["Trimestre"] == filtro_trimestre
-        ]
-    if filtro_semestre != "Todos":
-        tags_problematicos_filtrado = tags_problematicos_filtrado[
-            tags_problematicos_filtrado["Trimestre"].map(trimestre_a_semestre) == filtro_semestre
-        ]
-
-tags_problematicos_mes, eventos_problematicos_mes = preparar_problematicos_mensual(tags_problematicos_filtrado)
-
-datos_recurrencia_tiempo = preparar_datos_recurrencia_tiempo(
-    df_valid=df_valid,
+datos_recurrencia_mes = preparar_datos_recurrencia_mensual_filtrada(
+    base_mensual=base_mensual,
     recurrencia_sel=sel,
-    frecuencia=frecuencia_tiempo
+    filtro_trimestre=filtro_trimestre,
+    filtro_semestre=filtro_semestre
 )
 
-if not datos_recurrencia_tiempo.empty and periodo_desde and periodo_hasta:
-    datos_recurrencia_tiempo = datos_recurrencia_tiempo[
-        (datos_recurrencia_tiempo["Periodo"] >= periodo_desde) &
-        (datos_recurrencia_tiempo["Periodo"] <= periodo_hasta)
-    ].copy()
+problematicos_filtrados = problematicos_mensuales.copy()
+if not problematicos_filtrados.empty:
+    if filtro_trimestre != "Todos":
+        problematicos_filtrados = problematicos_filtrados[problematicos_filtrados["Trimestre"] == filtro_trimestre]
+    if filtro_semestre != "Todos":
+        problematicos_filtrados = problematicos_filtrados[problematicos_filtrados["Semestre"] == filtro_semestre]
 
-dist_recurrencia_mensual = preparar_distribucion_mensual_recurrencia(
-    dvalid_filtrado,
-    sel
-)
+tags_problematicos_mes = (
+    problematicos_filtrados.groupby("Mes")[COL_TAG]
+    .nunique()
+    .reset_index(name="Cantidad")
+    .sort_values("Mes")
+    .reset_index(drop=True)
+) if not problematicos_filtrados.empty else pd.DataFrame(columns=["Mes", "Cantidad"])
 
-proyeccion_futura = construir_proyeccion_criticidad_futura(
-    vista_all=vista_all,
+if not tags_problematicos_mes.empty:
+    tags_problematicos_mes["MesTexto"] = tags_problematicos_mes["Mes"].map(mes_a_texto)
+
+eventos_problematicos_mes = (
+    problematicos_filtrados.groupby("Mes")["Eventos_Problematicos_Mes"]
+    .sum()
+    .reset_index(name="Eventos")
+    .sort_values("Mes")
+    .reset_index(drop=True)
+) if not problematicos_filtrados.empty else pd.DataFrame(columns=["Mes", "Eventos"])
+
+if not eventos_problematicos_mes.empty:
+    eventos_problematicos_mes["MesTexto"] = eventos_problematicos_mes["Mes"].map(mes_a_texto)
+
+dist_recurrencia_mensual = datos_recurrencia_mes.copy()
+
+criticidad_filtrada = criticidad_mensual.copy()
+criticidad_filtrada = criticidad_filtrada[criticidad_filtrada["Recurrencia_Mes"] == sel].copy()
+
+if filtro_trimestre != "Todos":
+    criticidad_filtrada = criticidad_filtrada[criticidad_filtrada["Trimestre"] == filtro_trimestre]
+
+if filtro_semestre != "Todos":
+    criticidad_filtrada = criticidad_filtrada[criticidad_filtrada["Semestre"] == filtro_semestre]
+
+proyeccion_reemplazo_filtrada = proyeccion_reemplazo.copy()
+proyeccion_reemplazo_filtrada = proyeccion_reemplazo_filtrada[proyeccion_reemplazo_filtrada["Recurrencia_Mes"] == sel].copy()
+
+if filtro_trimestre != "Todos":
+    meses_trim = base_mensual.loc[base_mensual["Trimestre"] == filtro_trimestre, "MesTexto"].unique().tolist()
+    proyeccion_reemplazo_filtrada = proyeccion_reemplazo_filtrada[proyeccion_reemplazo_filtrada["MesTexto"].isin(meses_trim)]
+
+if filtro_semestre != "Todos":
+    meses_sem = base_mensual.loc[base_mensual["Semestre"] == filtro_semestre, "MesTexto"].unique().tolist()
+    proyeccion_reemplazo_filtrada = proyeccion_reemplazo_filtrada[proyeccion_reemplazo_filtrada["MesTexto"].isin(meses_sem)]
+
+proyeccion_futura = construir_proyeccion_criticidad_futura_mensual(
+    criticidad_mensual=criticidad_filtrada,
     meses_proyeccion=meses_proyeccion,
     recurrencia_sel=sel
 )
@@ -1342,8 +932,8 @@ k1.metric("Registros totales cargados", formato_entero(resumen["total_registros_
 k2.metric("Registros válidos regla 9 días", formato_entero(resumen["total_registros_validos"]))
 k3.metric("Registros descartados regla 9 días", formato_entero(resumen["total_registros_descartados"]))
 k4.metric("TAG únicos (archivo)", formato_entero(resumen["total_tags_unicos"]))
-k5.metric(f"TAG con recurrencia = {sel}", formato_entero(len(vista)))
-k6.metric(f"TAG con < {UMBRAL_PROBLEMATICO} días", formato_entero(resumen["cantidad_tags_problematicos"]))
+k5.metric(f"TAG con recurrencia mensual = {sel}", formato_entero(len(vista)))
+k6.metric(f"TAG problemáticos (rec. 2 o 3 y < {UMBRAL_PROBLEMATICO} días)", formato_entero(resumen["cantidad_tags_problematicos"]))
 
 st.markdown("---")
 
@@ -1364,24 +954,18 @@ with tab1:
     col_tabla, col_graf = st.columns([2.9, 1.1])
 
     with col_tabla:
-        st.subheader(f"📄 TAG con recurrencia = {sel} | Total registros: {len(vista)}")
+        st.subheader(f"📄 TAG con recurrencia mensual = {sel} | Total registros: {len(vista)}")
 
-        columnas_mostrar = ["TAG", "Recurrencias", "Total_Recurrencias"]
+        columnas_mostrar = ["MesTexto", "TAG", "Recurrencia_Mes"]
         for i in range(1, sel + 1):
             col = f"Mantenimiento_{i}°"
             if col in vista.columns:
                 columnas_mostrar.append(col)
 
         columnas_extra = [
-            "Ultima_Mantencion",
-            "Ultimo_Trimestre",
-            "Ultimo_Semestre",
-            "Dias_Desde_Ultima_Mantencion",
-            "MTBM_Dias",
-            "Eventos_Problematicos",
-            "Score_Criticidad",
-            "Riesgo",
-            "Accion_Sugerida"
+            "TrimestreTexto",
+            "SemestreTexto",
+            "Eventos_Problematicos_Mes"
         ]
 
         for col in columnas_extra:
@@ -1390,28 +974,25 @@ with tab1:
 
         vista_mostrar = vista[columnas_mostrar].copy() if not vista.empty else pd.DataFrame(columns=columnas_mostrar)
 
-        if "MTBM_Dias" in vista_mostrar.columns:
-            vista_mostrar["MTBM_Dias"] = pd.to_numeric(vista_mostrar["MTBM_Dias"], errors="coerce").round(1)
-
         row_h = 26
         altura = max(220, min(620, (len(vista_mostrar) + 1) * row_h))
 
         st.dataframe(
-            vista_mostrar,
+            vista_mostrar.rename(columns={
+                "MesTexto": "Mes",
+                "Recurrencia_Mes": "Recurrencia",
+                "TrimestreTexto": "Trimestre",
+                "SemestreTexto": "Semestre"
+            }),
             use_container_width=True,
             hide_index=True,
             height=altura
         )
 
     with col_graf:
-        if usar_vista_mensual:
-            graficar_recurrencia_mensual(datos_recurrencia_mes, sel)
-            st.markdown("---")
-            graficar_resumen_general_mensual(resumen_general_mes)
-        else:
-            graficar_resumen_trimestre(sel, datos_trim)
-            st.markdown("---")
-            graficar_resumen_general(dvalid_filtrado)
+        graficar_recurrencia_mensual(datos_recurrencia_mes, sel)
+        st.markdown("---")
+        graficar_resumen_general_mensual(resumen_general_mes)
 
 # =========================================================
 # TAB 2
@@ -1450,25 +1031,33 @@ with tab2:
         if recurrencias_mes_sel:
             tabla_mes = tabla_mes[tabla_mes["Recurrencia_Mes"].isin(recurrencias_mes_sel)]
 
+        if filtro_trimestre != "Todos":
+            meses_trim = base_mensual.loc[base_mensual["Trimestre"] == filtro_trimestre, "Mes"].unique().tolist()
+            tabla_mes = tabla_mes[tabla_mes["Mes"].isin(meses_trim)]
+
+        if filtro_semestre != "Todos":
+            meses_sem = base_mensual.loc[base_mensual["Semestre"] == filtro_semestre, "Mes"].unique().tolist()
+            tabla_mes = tabla_mes[tabla_mes["Mes"].isin(meses_sem)]
+
         tabla_mes = tabla_mes.sort_values(
             ["Mes", "Recurrencia_Mes", COL_TAG],
             ascending=[False, False, True]
         ).reset_index(drop=True)
 
         st.caption(
-            "Se muestran los TAG que dentro del mes seleccionado tuvieron recurrencia 2 o 3, "
+            "Se muestran los TAG que dentro del mismo mes tuvieron recurrencia 2 o 3, "
             "usando solo registros válidos de la regla de 9 días."
         )
 
         columnas_tabla_mes = [
-            "Mes_Texto", "TAG", "Recurrencia_Mes",
+            "MesTexto", "TAG", "Recurrencia_Mes",
             "Mantenimiento_1°", "Mantenimiento_2°", "Mantenimiento_3°"
         ]
 
         st.dataframe(
             tabla_mes[columnas_tabla_mes].rename(columns={
-                "Mes_Texto": "Mes",
-                "Recurrencia_Mes": "Recurrencias_Mes"
+                "MesTexto": "Mes",
+                "Recurrencia_Mes": "Recurrencia"
             }),
             use_container_width=True,
             hide_index=True,
@@ -1479,64 +1068,64 @@ with tab2:
 # TAB 3
 # =========================================================
 with tab3:
-    st.subheader(f"⚠️ TAG que repitieron mantención en menos de {UMBRAL_PROBLEMATICO} días")
+    st.subheader(f"⚠️ TAG problemáticos con recurrencia mensual = {sel}")
+    st.caption("Solo se consideran problemáticos los TAG con recurrencia 2 o 3 dentro del mismo mes y con separación menor a 30 días.")
 
     c1, c2 = st.columns(2)
     with c1:
-        st.metric("TAG problemáticos", formato_entero(resumen["cantidad_tags_problematicos"]))
-    with c2:
-        st.metric("Eventos detectados", formato_entero(resumen["cantidad_eventos_problematicos"]))
-
-    if tags_problematicos_df.empty:
-        st.success(f"No se detectaron TAG con repeticiones menores a {UMBRAL_PROBLEMATICO} días.")
-        vista_problematicos = pd.DataFrame()
-    else:
-        vista_problematicos = tags_problematicos_df[[COL_TAG, COL_FECHA, "DiasEntreMantenciones", "Trimestre"]].copy()
-        vista_problematicos["Semestre"] = vista_problematicos["Trimestre"].map(trimestre_a_semestre)
-
-        vista_problematicos = vista_problematicos.rename(columns={
-            COL_TAG: "TAG",
-            COL_FECHA: "Fecha_Mantencion",
-            "DiasEntreMantenciones": "Dias_Entre_Mantenciones"
-        })
-
-        vista_problematicos["Fecha_Mantencion"] = pd.to_datetime(
-            vista_problematicos["Fecha_Mantencion"]
-        ).dt.strftime("%Y-%m-%d")
-        vista_problematicos["Trimestre"] = vista_problematicos["Trimestre"].map(trimestre_a_texto)
-        vista_problematicos["Semestre"] = vista_problematicos["Semestre"].map(semestre_a_texto)
-
-        st.dataframe(
-            vista_problematicos.sort_values("Fecha_Mantencion", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-            height=280
+        st.metric(
+            "TAG problemáticos",
+            formato_entero(problematicos_filtrados[COL_TAG].nunique() if not problematicos_filtrados.empty else 0)
         )
+    with c2:
+        st.metric(
+            "Eventos detectados",
+            formato_entero(int(problematicos_filtrados["Eventos_Problematicos_Mes"].sum()) if not problematicos_filtrados.empty else 0)
+        )
+
+    vista_problematicos = problematicos_filtrados.copy()
+
+    if vista_problematicos.empty:
+        st.success(f"No se detectaron TAG problemáticos con recurrencia 2 o 3 y menos de {UMBRAL_PROBLEMATICO} días.")
+    else:
+        vista_problematicos = vista_problematicos[vista_problematicos["Recurrencia_Mes"] == sel].copy()
+
+        if not vista_problematicos.empty:
+            st.dataframe(
+                vista_problematicos[[
+                    "MesTexto", "TAG", "Recurrencia_Mes",
+                    "Eventos_Problematicos_Mes", "Min_Dias"
+                ]].rename(columns={
+                    "MesTexto": "Mes",
+                    "Recurrencia_Mes": "Recurrencia",
+                    "Eventos_Problematicos_Mes": "Eventos_Problematicos",
+                    "Min_Dias": "Min_Dias_Entre_Mantenciones"
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=280
+            )
+        else:
+            st.info("No hay TAG problemáticos para la recurrencia mensual seleccionada.")
 
         st.markdown("---")
         st.subheader("📊 Análisis de TAG problemáticos")
 
         col_prob_1, col_prob_2 = st.columns(2)
 
-        if usar_vista_mensual:
-            with col_prob_1:
-                graficar_problematicos_mes(tags_problematicos_mes)
-            with col_prob_2:
-                graficar_eventos_problematicos_mes(eventos_problematicos_mes)
-        else:
-            with col_prob_1:
-                graficar_problematicos_trimestre(tags_problematicos_df)
-            with col_prob_2:
-                graficar_problematicos_semestre(tags_problematicos_df)
+        with col_prob_1:
+            graficar_problematicos_mes(tags_problematicos_mes)
+
+        with col_prob_2:
+            graficar_eventos_problematicos_mes(eventos_problematicos_mes)
 
         st.markdown("---")
         col_dist_1, col_dist_2 = st.columns(2)
 
         with col_dist_1:
             graficar_recurrencia_en_el_tiempo(
-                df_tiempo=datos_recurrencia_tiempo,
-                recurrencia_sel=sel,
-                etiqueta_periodo=etiqueta_periodo
+                datos_recurrencia_mes,
+                sel
             )
 
         with col_dist_2:
@@ -1551,21 +1140,27 @@ with tab3:
 with tab4:
     st.subheader("🛠️ Proyección de reemplazo y criticidad")
 
-    if proyeccion_reemplazo.empty:
+    if proyeccion_reemplazo_filtrada.empty:
         st.info("No hay datos para proyección.")
     else:
         col_p1, col_p2 = st.columns([2, 1])
 
         with col_p1:
             st.dataframe(
-                proyeccion_reemplazo,
+                proyeccion_reemplazo_filtrada.rename(columns={
+                    "MesTexto": "Mes",
+                    "Recurrencia_Mes": "Recurrencia",
+                    "Eventos_Problematicos_Mes": "Eventos_Problematicos",
+                    "Score_Criticidad_Mes": "Score_Criticidad",
+                    "Riesgo_Mes": "Riesgo"
+                }),
                 use_container_width=True,
                 hide_index=True,
                 height=420
             )
 
         with col_p2:
-            graficar_reemplazo_proyectado(proyeccion_reemplazo)
+            graficar_reemplazo_proyectado(proyeccion_reemplazo_filtrada)
 
         st.markdown("---")
         st.subheader(f"🔮 Evolución estimada de criticidad a {meses_proyeccion} meses")
@@ -1574,7 +1169,12 @@ with tab4:
 
         with col_f1:
             st.dataframe(
-                proyeccion_futura,
+                proyeccion_futura.rename(columns={
+                    "MesTexto": "Mes",
+                    "Recurrencia_Mes": "Recurrencia_Actual",
+                    "Eventos_Problematicos_Mes": "Eventos_Problematicos_Actuales",
+                    "Score_Criticidad_Mes": "Score_Actual"
+                }),
                 use_container_width=True,
                 hide_index=True,
                 height=380
@@ -1599,7 +1199,7 @@ with col_d1:
     st.download_button(
         "Descargar CSV vista actual",
         data=csv_vista,
-        file_name=f"spence_recurrencia_{sel}.csv",
+        file_name=f"spence_recurrencia_mensual_{sel}.csv",
         mime="text/csv"
     )
 
@@ -1613,11 +1213,7 @@ with col_d2:
     )
 
 with col_d3:
-    if not tags_problematicos_df.empty:
-        csv_prob = vista_problematicos.to_csv(index=False).encode("utf-8-sig")
-    else:
-        csv_prob = b""
-
+    csv_prob = problematicos_filtrados.to_csv(index=False).encode("utf-8-sig") if not problematicos_filtrados.empty else b""
     st.download_button(
         "Descargar CSV TAG problemáticos",
         data=csv_prob,
@@ -1626,15 +1222,15 @@ with col_d3:
     )
 
 with col_d4:
-    csv_all = vista_all.to_csv(index=False).encode("utf-8-sig") if not vista_all.empty else b""
+    csv_crit = criticidad_filtrada.to_csv(index=False).encode("utf-8-sig") if not criticidad_filtrada.empty else b""
     st.download_button(
-        "Descargar CSV recurrencias 1+",
-        data=csv_all,
-        file_name="spence_recurrencias_completo.csv",
+        "Descargar CSV criticidad mensual",
+        data=csv_crit,
+        file_name="spence_criticidad_mensual.csv",
         mime="text/csv"
     )
 
 st.caption(
-    "Dashboard optimizado para análisis de mantenciones, detección de recurrencias, "
-    "identificación de TAG problemáticos, evolución temporal y apoyo a decisiones de reemplazo."
+    "Dashboard optimizado para análisis de mantenciones con lógica de recurrencia mensual, "
+    "identificación de TAG problemáticos, criticidad y apoyo a decisiones de reemplazo."
 )
