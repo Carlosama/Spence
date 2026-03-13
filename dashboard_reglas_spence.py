@@ -10,22 +10,16 @@ from pathlib import Path
 # CONFIGURACIÓN GENERAL
 # =========================================================
 st.set_page_config(
-    page_title="ANÁLISIS DE MANTENCIONES POR MINERA",
+    page_title="ANÁLISIS DE MANTENCIONES MINERA SPENCE",
     layout="wide"
 )
 
-COL_TAG = "FinalTAG"
+COL_TAG = "TAG"
 COL_FECHA = "Fecha_Ingreso"
 MIN_GAP_DIAS = 9
 UMBRAL_PROBLEMATICO = 30
-
-RUTA_LOCAL = Path(r"C:\Users\Carlos Molina\OneDrive - ICL CATODOS\Escritorio\Proyectos Carlos Diaz\3.- ANALISIS DE DATOS\DATOS_MINERAS.xlsx")
-# RUTA_LOCAL = Path("DATOS_MINERAS.xlsx")
-
-MINERAS_VALIDAS = [
-    "MELN", "GABY", "CEN", "ANTU", "SPNC",
-    "LOMAS", "ABRA", "MICH", "REF2", "FRANKE"
-]
+# RUTA_LOCAL = Path(r"C:\Users\Carlos Molina\OneDrive - ICL CATODOS\Escritorio\Proyectos Carlos Diaz\3.- ANALISIS DE DATOS\DATOSSPENCE.xlsx")
+RUTA_LOCAL = Path("DATOSSPENCE.xlsx")
 
 # =========================================================
 # TEXTOS Y MAPAS
@@ -108,27 +102,6 @@ def preparar_labels_mes(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def limpiar_tag(valor) -> str:
-    if pd.isna(valor):
-        return ""
-    txt = str(valor).strip().upper()
-    if txt in ["", "NAN", "NONE", "NULL"]:
-        return ""
-    return txt
-
-
-def extraer_minera_desde_tag(tag: str) -> str:
-    tag = limpiar_tag(tag)
-    if not tag:
-        return ""
-
-    for minera in sorted(MINERAS_VALIDAS, key=len, reverse=True):
-        if tag.startswith(minera):
-            return minera
-
-    return ""
-
-
 # =========================================================
 # CARGA
 # =========================================================
@@ -151,22 +124,15 @@ def preparar_datos_base(df_raw: pd.DataFrame):
 
     faltan = [c for c in [COL_TAG, COL_FECHA] if c not in df.columns]
     if faltan:
-        raise ValueError(f"Faltan columnas requeridas en el Excel: {faltan}")
+        raise ValueError(f"Faltan columnas requeridas: {faltan}")
 
-    df[COL_TAG] = df[COL_TAG].apply(limpiar_tag)
+    df[COL_TAG] = df[COL_TAG].astype(str).str.strip().str.upper()
     df[COL_FECHA] = pd.to_datetime(df[COL_FECHA], errors="coerce")
 
-    df["Minera"] = df[COL_TAG].apply(extraer_minera_desde_tag)
+    df = df.dropna(subset=[COL_TAG, COL_FECHA]).copy()
+    df = df.sort_values([COL_TAG, COL_FECHA]).reset_index(drop=True)
 
-    df = df[
-        (df[COL_TAG] != "") &
-        df[COL_FECHA].notna() &
-        (df["Minera"] != "")
-    ].copy()
-
-    df = df.sort_values(["Minera", COL_TAG, COL_FECHA]).reset_index(drop=True)
-
-    # Regla de 9 días por TAG
+    # Regla de 9 días
     df["DeltaDias"] = df.groupby(COL_TAG)[COL_FECHA].diff().dt.days
     df["EventoValido"] = df["DeltaDias"].isna() | (df["DeltaDias"] >= MIN_GAP_DIAS)
 
@@ -556,15 +522,12 @@ def construir_tabla_recurrencias_periodo_completa(
     if tipo_revision == "Trimestral" and valor_revision:
         d_periodo = d[d["Trimestre"] == valor_revision].copy()
         etiqueta_periodo = trimestre_a_texto(valor_revision)
-
     elif tipo_revision == "Semestral" and valor_revision:
         d_periodo = d[d["Semestre"] == valor_revision].copy()
         etiqueta_periodo = semestre_a_texto(valor_revision)
-
     elif tipo_revision == "Anual" and valor_revision:
         d_periodo = d[d["Anio"] == valor_revision].copy()
         etiqueta_periodo = str(valor_revision)
-
     else:
         return pd.DataFrame(), pd.DataFrame(), []
 
@@ -999,6 +962,15 @@ def graficar_recurrencias_mensuales_periodo(
 
 
 # =========================================================
+# INTERFAZ
+# =========================================================
+st.title("ANÁLISIS DE DATOS MINERA SPENCE")
+st.caption(
+    "Las recurrencias se calculan agrupando registros válidos del mismo TAG dentro del mismo mes. "
+    "Recurrencia 1 = 1 vez en el mes, Recurrencia 2 = 2 veces en el mes, Recurrencia 3 = 3 veces en el mes."
+)
+
+# =========================================================
 # CARGA DE ARCHIVO
 # =========================================================
 st.sidebar.header("📂 Carga de datos")
@@ -1020,88 +992,44 @@ if modo_carga == "Subir Excel":
 else:
     if not RUTA_LOCAL.exists():
         st.error(f"No encuentro el archivo en la ruta local: {RUTA_LOCAL}")
-        st.info("Pon tu archivo Excel en la ruta configurada o usa 'Subir Excel'.")
+        st.info("Pon DATOSSPENCE.xlsx en la misma carpeta del proyecto o usa 'Subir Excel'.")
         st.stop()
     df_raw = cargar_excel_desde_ruta(str(RUTA_LOCAL))
 
 # =========================================================
-# PROCESAMIENTO BASE
+# PROCESAMIENTO
 # =========================================================
 try:
-    df_base, df_valid_base = preparar_datos_base(df_raw)
+    df, df_valid = preparar_datos_base(df_raw)
+
+    total_registros_archivo = len(df)
+    total_registros_validos = len(df_valid)
+    total_registros_descartados = len(df) - len(df_valid)
+    total_tags_unicos = df[COL_TAG].nunique()
+
+    base_mensual = construir_recurrencia_mensual_por_tag(df_valid)
+    detalle_mensual = construir_detalle_recurrencia_mensual(df_valid)
+    problematicos_mensuales = construir_problematicos_mensuales(df_valid)
+    criticidad_mensual = construir_criticidad_mensual(base_mensual, problematicos_mensuales)
+    tabla_mensual_repetidos = construir_tabla_mensual_repetidos(base_mensual, detalle_mensual)
+    proyeccion_reemplazo = construir_proyeccion_reemplazo_mensual(criticidad_mensual)
+
+    resumen = {
+        "total_registros_archivo": total_registros_archivo,
+        "total_registros_validos": total_registros_validos,
+        "total_registros_descartados": total_registros_descartados,
+        "total_tags_unicos": total_tags_unicos,
+        "cantidad_tags_problematicos": problematicos_mensuales[COL_TAG].nunique() if not problematicos_mensuales.empty else 0,
+        "cantidad_eventos_problematicos": int(problematicos_mensuales["Eventos_Problematicos_Mes"].sum()) if not problematicos_mensuales.empty else 0,
+    }
+
 except Exception as e:
     st.error(f"Error al procesar archivo: {e}")
     st.stop()
 
-if df_valid_base.empty:
-    st.warning("No hay registros válidos después de aplicar limpieza, detección de minera y regla de 9 días.")
-    st.stop()
-
-# =========================================================
-# SELECCIÓN DE MINERA
-# =========================================================
-st.sidebar.header("🏭 Selección de minera")
-
-mineras_disponibles = sorted(df_valid_base["Minera"].dropna().unique().tolist())
-
-if not mineras_disponibles:
-    st.error("No se encontraron mineras válidas en la data.")
-    st.stop()
-
-minera_sel = st.sidebar.selectbox(
-    "Selecciona una minera",
-    options=["Seleccione una minera..."] + mineras_disponibles,
-    index=0
-)
-
-if minera_sel == "Seleccione una minera...":
-    st.title("ANÁLISIS DE DATOS POR MINERA")
-    st.info("Selecciona una minera en la barra lateral para comenzar el análisis.")
-    st.stop()
-
-# =========================================================
-# FILTRO POR MINERA
-# =========================================================
-df = df_base[df_base["Minera"] == minera_sel].copy()
-df_valid = df_valid_base[df_valid_base["Minera"] == minera_sel].copy()
-
 if df_valid.empty:
-    st.title(f"ANÁLISIS DE DATOS MINERA {minera_sel}")
-    st.warning(f"No hay registros válidos para la minera {minera_sel}.")
+    st.warning("No hay registros válidos después de aplicar limpieza y regla de 9 días.")
     st.stop()
-
-# =========================================================
-# RECONSTRUCCIÓN EN BASE A MINERA
-# =========================================================
-total_registros_archivo = len(df)
-total_registros_validos = len(df_valid)
-total_registros_descartados = len(df) - len(df_valid)
-total_tags_unicos = df[COL_TAG].nunique()
-
-base_mensual = construir_recurrencia_mensual_por_tag(df_valid)
-detalle_mensual = construir_detalle_recurrencia_mensual(df_valid)
-problematicos_mensuales = construir_problematicos_mensuales(df_valid)
-criticidad_mensual = construir_criticidad_mensual(base_mensual, problematicos_mensuales)
-tabla_mensual_repetidos = construir_tabla_mensual_repetidos(base_mensual, detalle_mensual)
-proyeccion_reemplazo = construir_proyeccion_reemplazo_mensual(criticidad_mensual)
-
-resumen = {
-    "total_registros_archivo": total_registros_archivo,
-    "total_registros_validos": total_registros_validos,
-    "total_registros_descartados": total_registros_descartados,
-    "total_tags_unicos": total_tags_unicos,
-    "cantidad_tags_problematicos": problematicos_mensuales[COL_TAG].nunique() if not problematicos_mensuales.empty else 0,
-    "cantidad_eventos_problematicos": int(problematicos_mensuales["Eventos_Problematicos_Mes"].sum()) if not problematicos_mensuales.empty else 0,
-}
-
-# =========================================================
-# INTERFAZ
-# =========================================================
-st.title(f"ANÁLISIS DE DATOS MINERA {minera_sel}")
-st.caption(
-    "Las recurrencias se calculan agrupando registros válidos del mismo TAG dentro del mismo mes. "
-    "Recurrencia 1 = 1 vez en el mes, Recurrencia 2 = 2 veces en el mes, Recurrencia 3 = 3 veces en el mes."
-)
 
 # =========================================================
 # SIDEBAR FILTROS GLOBALES
@@ -1213,7 +1141,7 @@ k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Registros totales cargados", formato_entero(resumen["total_registros_archivo"]))
 k2.metric("Registros válidos regla 9 días", formato_entero(resumen["total_registros_validos"]))
 k3.metric("Registros descartados regla 9 días", formato_entero(resumen["total_registros_descartados"]))
-k4.metric("TAG únicos (minera)", formato_entero(resumen["total_tags_unicos"]))
+k4.metric("TAG únicos (archivo)", formato_entero(resumen["total_tags_unicos"]))
 k5.metric(f"TAG con recurrencia mensual = {sel}", formato_entero(len(vista)))
 k6.metric(f"TAG problemáticos (rec. 2 o 3 y < {UMBRAL_PROBLEMATICO} días)", formato_entero(resumen["cantidad_tags_problematicos"]))
 
@@ -1605,12 +1533,12 @@ with tab5:
     st.download_button(
         "Descargar CSV recurrencias del período",
         data=csv_tab5,
-        file_name=f"{minera_sel}_recurrencias_{tipo_revision.lower()}_{valor_revision}_rec_{recurrencia_revision}.csv",
+        file_name=f"spence_recurrencias_{tipo_revision.lower()}_{valor_revision}_rec_{recurrencia_revision}.csv",
         mime="text/csv",
         key="descarga_unica_tab5"
     )
 
 st.caption(
-    f"Dashboard optimizado para análisis de mantenciones de {minera_sel}, "
-    "con lógica de recurrencia mensual, identificación de TAG problemáticos, criticidad y apoyo a decisiones de reemplazo."
+    "Dashboard optimizado para análisis de mantenciones con lógica de recurrencia mensual, "
+    "identificación de TAG problemáticos, criticidad y apoyo a decisiones de reemplazo."
 )
